@@ -242,3 +242,97 @@
     )
   )
 )
+
+
+(define-map player-statistics
+  { player: principal }
+  {
+    tournaments-played: uint,
+    tournaments-won: uint,
+    total-earnings: uint,
+    best-position: uint
+  }
+)
+
+(define-read-only (get-player-stats (player principal))
+  (default-to
+    { tournaments-played: u0, tournaments-won: u0, total-earnings: u0, best-position: u999 }
+    (map-get? player-statistics { player: player })
+  )
+)
+
+(define-public (update-player-statistics (tournament-id uint) (player principal) (position uint) (earnings uint))
+  (let (
+    (current-stats (get-player-stats player))
+    (new-best-position (if (< position (get best-position current-stats))
+      position
+      (get best-position current-stats)))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set player-statistics
+      { player: player }
+      {
+        tournaments-played: (+ (get tournaments-played current-stats) u1),
+        tournaments-won: (if (is-eq position u1) 
+          (+ (get tournaments-won current-stats) u1)
+          (get tournaments-won current-stats)),
+        total-earnings: (+ (get total-earnings current-stats) earnings),
+        best-position: new-best-position
+      }
+    )
+    (ok true)
+  )
+)
+
+
+(define-public (get-tournament-participants (tournament-id uint) (participant principal))
+  (let ((participants (map-get? tournament-participants { tournament-id: tournament-id, participant: participant })))
+    (if (is-some participants)
+      (ok participants)
+      (err err-not-registered)
+    )
+  )
+)
+
+
+(define-public (get-tournament-winner-advance (tournament-id uint) (position uint))
+  (let ((winner (map-get? tournament-winners { tournament-id: tournament-id, position: position })))
+    (if (is-some winner)
+      (ok winner)
+      (err err-not-registered)
+    )
+  )
+)(define-map tournament-sponsors
+  { tournament-id: uint, sponsor: principal }
+  { amount: uint }
+)
+
+(define-read-only (get-sponsor-contribution (tournament-id uint) (sponsor principal))
+  (default-to
+    { amount: u0 }
+    (map-get? tournament-sponsors { tournament-id: tournament-id, sponsor: sponsor })
+  )
+)
+
+(define-public (sponsor-tournament (tournament-id uint) (amount uint))
+  (let (
+    (tournament (unwrap! (map-get? tournaments { tournament-id: tournament-id }) err-invalid-tournament-id))
+    (current-contribution (get amount (get-sponsor-contribution tournament-id tx-sender)))
+  )
+    (asserts! (get registration-open tournament) err-tournament-not-active)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (map-set tournament-sponsors
+      { tournament-id: tournament-id, sponsor: tx-sender }
+      { amount: (+ current-contribution amount) }
+    )
+    
+    (map-set tournaments
+      { tournament-id: tournament-id }
+      (merge tournament {
+        total-prize-pool: (+ (get total-prize-pool tournament) amount)
+      })
+    )
+    (ok true)
+  )
+)
