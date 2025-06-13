@@ -336,3 +336,265 @@
     (ok true)
   )
 )
+
+
+(define-constant err-invalid-match-id (err u112))
+(define-constant err-match-already-played (err u113))
+(define-constant err-not-match-participant (err u114))
+(define-constant err-bracket-not-generated (err u115))
+(define-constant err-bracket-already-exists (err u116))
+
+(define-data-var match-counter uint u0)
+
+(define-map tournament-brackets
+  { tournament-id: uint }
+  {
+    total-rounds: uint,
+    current-round: uint,
+    bracket-generated: bool,
+    matches-per-round: (list 10 uint)
+  }
+)
+
+(define-map bracket-matches
+  { tournament-id: uint, match-id: uint }
+  {
+    round: uint,
+    player1: (optional principal),
+    player2: (optional principal),
+    winner: (optional principal),
+    match-completed: bool,
+    next-match-id: (optional uint)
+  }
+)
+
+(define-map player-bracket-position
+  { tournament-id: uint, player: principal }
+  {
+    current-match-id: (optional uint),
+    eliminated: bool,
+    elimination-round: (optional uint)
+  }
+)
+
+(define-read-only (get-tournament-bracket (tournament-id uint))
+  (map-get? tournament-brackets { tournament-id: tournament-id })
+)
+
+(define-read-only (get-bracket-match (tournament-id uint) (match-id uint))
+  (map-get? bracket-matches { tournament-id: tournament-id, match-id: match-id })
+)
+
+(define-read-only (get-player-bracket-status (tournament-id uint) (player principal))
+  (map-get? player-bracket-position { tournament-id: tournament-id, player: player })
+)
+
+(define-public (generate-tournament-bracket (tournament-id uint))
+  (let (
+    (tournament (unwrap! (map-get? tournaments { tournament-id: tournament-id }) (err u100)))
+    (existing-bracket (map-get? tournament-brackets { tournament-id: tournament-id }))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (not (get registration-open tournament)) err-tournament-not-active)
+    (asserts! (is-none existing-bracket) err-bracket-already-exists)
+    
+    (let (
+      (participant-count (get participant-count tournament))
+      (total-rounds (calculate-rounds participant-count))
+      (first-round-matches (/ participant-count u2))
+    )
+      (map-set tournament-brackets
+        { tournament-id: tournament-id }
+        {
+          total-rounds: total-rounds,
+          current-round: u1,
+          bracket-generated: true,
+          matches-per-round: (list first-round-matches)
+        }
+      )
+      
+      ;; (try! (create-first-round-matches tournament-id participant-count))
+      (ok true)
+    )
+  )
+)
+(define-private (calculate-rounds (participants uint))
+  (if (<= participants u2) u1
+    (if (<= participants u4) u2
+      (if (<= participants u8) u3
+        (if (<= participants u16) u4
+          (if (<= participants u32) u5 u6)))))
+)
+
+(define-private (create-first-round-matches (tournament-id uint) (participant-count uint))
+  (begin
+    (let ((matches-needed (/ participant-count u2)))
+      (fold create-match-fold 
+        (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16)
+        { tournament-id: tournament-id, matches-created: u0, matches-needed: matches-needed }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-private (create-match-fold 
+  (index uint) 
+  (data { tournament-id: uint, matches-created: uint, matches-needed: uint })
+)
+  (if (< (get matches-created data) (get matches-needed data))
+    (begin
+      (var-set match-counter (+ (var-get match-counter) u1))
+      (map-set bracket-matches
+        { tournament-id: (get tournament-id data), match-id: (var-get match-counter) }
+        {
+          round: u1,
+          player1: none,
+          player2: none,
+          winner: none,
+          match-completed: false,
+          next-match-id: none
+        }
+      )
+      (merge data { matches-created: (+ (get matches-created data) u1) })
+    )
+    data
+  )
+)
+
+(define-public (assign-players-to-bracket (tournament-id uint) (player-assignments (list 32 { player: principal, match-id: uint, position: uint, tournament-id: uint })))
+  (let ((bracket (unwrap! (map-get? tournament-brackets { tournament-id: tournament-id }) err-bracket-not-generated)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (get bracket-generated bracket) err-bracket-not-generated)
+    
+    (try! (fold assign-player-to-match player-assignments (ok tournament-id)))
+    (ok true)
+  )
+)
+
+(define-private (assign-player-to-match (assignment { player: principal, match-id: uint, position: uint, tournament-id: uint }) (previous-result (response uint uint)))
+  (let (
+    (player (get player assignment))
+    (match-id (get match-id assignment))
+    (position (get position assignment))
+    (tournament-id (get tournament-id assignment))
+    (current-match (unwrap! (map-get? bracket-matches { tournament-id: tournament-id, match-id: match-id }) (err u0)))
+  )
+    (if (is-eq position u1)
+      (begin
+        (map-set bracket-matches
+          { tournament-id: tournament-id, match-id: match-id }
+          (merge current-match { player1: (some player) })
+        )
+        (map-set player-bracket-position
+          { tournament-id: tournament-id, player: player }
+          {
+            current-match-id: (some match-id),
+            eliminated: false,
+            elimination-round: none
+          }
+        )
+        (ok tournament-id)
+      )
+      (begin
+        (map-set bracket-matches
+          { tournament-id: tournament-id, match-id: match-id }
+          (merge current-match { player2: (some player) })
+        )
+        (map-set player-bracket-position
+          { tournament-id: tournament-id, player: player }
+          {
+            current-match-id: (some match-id),
+            eliminated: false,
+            elimination-round: none
+          }
+        )
+        (ok tournament-id)
+      )
+    )
+  )
+)
+
+(define-public (report-match-result (tournament-id uint) (match-id uint) (winner principal))
+  (let (
+    (bracket (unwrap! (map-get? tournament-brackets { tournament-id: tournament-id }) err-bracket-not-generated))
+    (match-data (unwrap! (map-get? bracket-matches { tournament-id: tournament-id, match-id: match-id }) err-invalid-match-id))
+    (tournament (unwrap! (map-get? tournaments { tournament-id: tournament-id }) err-invalid-tournament-id))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (not (get match-completed match-data)) err-match-already-played)
+    (asserts! (not (get registration-open tournament)) err-tournament-not-active)
+    
+    (let (
+      (player1 (get player1 match-data))
+      (player2 (get player2 match-data))
+      (loser (if (is-eq (some winner) player1) player2 player1))
+    )
+      (asserts! (or (is-eq (some winner) player1) (is-eq (some winner) player2)) err-not-match-participant)
+      
+      (map-set bracket-matches
+        { tournament-id: tournament-id, match-id: match-id }
+        (merge match-data { winner: (some winner), match-completed: true })
+      )
+      
+      (match loser
+        eliminated-player (map-set player-bracket-position
+          { tournament-id: tournament-id, player: eliminated-player }
+          {
+            current-match-id: none,
+            eliminated: true,
+            elimination-round: (some (get round match-data))
+          }
+        )
+        true
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+(define-public (advance-bracket-round (tournament-id uint))
+  (let (
+    (bracket (unwrap! (map-get? tournament-brackets { tournament-id: tournament-id }) err-bracket-not-generated))
+    (current-round (get current-round bracket))
+    (total-rounds (get total-rounds bracket))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (< current-round total-rounds) err-tournament-not-active)
+    
+    (map-set tournament-brackets
+      { tournament-id: tournament-id }
+      (merge bracket { current-round: (+ current-round u1) })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-round-matches (tournament-id uint) (round uint))
+  (let ((bracket (map-get? tournament-brackets { tournament-id: tournament-id })))
+    (if (is-some bracket)
+      (ok (filter-matches-by-round tournament-id round))
+      (err err-bracket-not-generated)
+    )
+  )
+)
+
+(define-private (filter-matches-by-round (tournament-id uint) (target-round uint))
+  (list 
+    (map-get? bracket-matches { tournament-id: tournament-id, match-id: u1 })
+    (map-get? bracket-matches { tournament-id: tournament-id, match-id: u2 })
+    (map-get? bracket-matches { tournament-id: tournament-id, match-id: u3 })
+    (map-get? bracket-matches { tournament-id: tournament-id, match-id: u4 })
+  )
+)
+
+(define-read-only (is-tournament-bracket-complete (tournament-id uint))
+  (let ((bracket (map-get? tournament-brackets { tournament-id: tournament-id })))
+    (match bracket
+      bracket-data (is-eq (get current-round bracket-data) (get total-rounds bracket-data))
+      false
+    )
+  )
+)
