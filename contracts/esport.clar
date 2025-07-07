@@ -20,6 +20,32 @@
 
 (define-data-var tournament-counter uint u0)
 
+(define-constant err-leaderboard-not-found (err u117))
+(define-constant err-invalid-leaderboard-entry (err u118))
+
+(define-data-var global-leaderboard-size uint u0)
+
+(define-map global-leaderboard
+  { rank: uint }
+  {
+    player: principal,
+    rating: uint,
+    tournaments-completed: uint,
+    total-prize-money: uint,
+    win-rate: uint
+  }
+)
+
+(define-map player-leaderboard-position
+  { player: principal }
+  {
+    current-rank: uint,
+    previous-rank: uint,
+    rating: uint,
+    last-tournament-date: uint
+  }
+)
+
 (define-map tournaments
   { tournament-id: uint }
   {
@@ -596,5 +622,180 @@
       bracket-data (is-eq (get current-round bracket-data) (get total-rounds bracket-data))
       false
     )
+  )
+)
+
+
+
+(define-read-only (get-leaderboard-entry (rank uint))
+  (map-get? global-leaderboard { rank: rank })
+)
+
+(define-read-only (get-player-leaderboard-position (player principal))
+  (map-get? player-leaderboard-position { player: player })
+)
+
+(define-read-only (get-leaderboard-size)
+  (var-get global-leaderboard-size)
+)
+
+(define-read-only (get-top-players (limit uint))
+  (let ((actual-limit (if (> limit u10) u10 limit)))
+    (list 
+      (if (>= actual-limit u1) (map-get? global-leaderboard { rank: u1 }) none)
+      (if (>= actual-limit u2) (map-get? global-leaderboard { rank: u2 }) none)
+      (if (>= actual-limit u3) (map-get? global-leaderboard { rank: u3 }) none)
+      (if (>= actual-limit u4) (map-get? global-leaderboard { rank: u4 }) none)
+      (if (>= actual-limit u5) (map-get? global-leaderboard { rank: u5 }) none)
+      (if (>= actual-limit u6) (map-get? global-leaderboard { rank: u6 }) none)
+      (if (>= actual-limit u7) (map-get? global-leaderboard { rank: u7 }) none)
+      (if (>= actual-limit u8) (map-get? global-leaderboard { rank: u8 }) none)
+      (if (>= actual-limit u9) (map-get? global-leaderboard { rank: u9 }) none)
+      (if (>= actual-limit u10) (map-get? global-leaderboard { rank: u10 }) none)
+    )
+  )
+)
+
+(define-public (update-leaderboard-after-tournament (tournament-id uint) (player principal) (final-position uint) (prize-amount uint))
+  (let (
+    (tournament (unwrap! (map-get? tournaments { tournament-id: tournament-id }) err-invalid-tournament-id))
+    (current-player-position (map-get? player-leaderboard-position { player: player }))
+    (current-stats (get-player-stats player))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (get tournament-ended tournament) err-tournament-not-ended)
+    
+    (let (
+      (rating-change (calculate-rating-change final-position (get participant-count tournament) prize-amount))
+      (current-rating (match current-player-position
+        position-data (get rating position-data)
+        u1000))
+      (new-rating (+ current-rating rating-change))
+      (new-win-rate (calculate-win-rate (get tournaments-won current-stats) (get tournaments-played current-stats)))
+    )
+      (match current-player-position
+        existing-position (update-existing-leaderboard-position player existing-position new-rating new-win-rate prize-amount)
+        (create-new-leaderboard-position player new-rating new-win-rate prize-amount)
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-private (calculate-rating-change (position uint) (total-participants uint) (prize-amount uint))
+  (let (
+    (position-bonus (if (<= position u3) (- u4 position) u0))
+    (participation-bonus u10)
+    (prize-bonus (/ prize-amount u100))
+  )
+    (+ position-bonus participation-bonus prize-bonus)
+  )
+)
+
+(define-private (calculate-win-rate (tournaments-won uint) (tournaments-played uint))
+  (if (is-eq tournaments-played u0)
+    u0
+    (/ (* tournaments-won u100) tournaments-played)
+  )
+)
+
+(define-private (update-existing-leaderboard-position (player principal) (existing-position { current-rank: uint, previous-rank: uint, rating: uint, last-tournament-date: uint }) (new-rating uint) (new-win-rate uint) (prize-amount uint))
+  (let (
+    (current-rank (get current-rank existing-position))
+    (current-stats (get-player-stats player))
+  )
+    (map-set player-leaderboard-position
+      { player: player }
+      {
+        current-rank: current-rank,
+        previous-rank: current-rank,
+        rating: new-rating,
+        last-tournament-date: stacks-block-height
+      }
+    )
+    
+    (map-set global-leaderboard
+      { rank: current-rank }
+      {
+        player: player,
+        rating: new-rating,
+        tournaments-completed: (get tournaments-played current-stats),
+        total-prize-money: (get total-earnings current-stats),
+        win-rate: new-win-rate
+      }
+    )
+    true
+  )
+)
+
+(define-private (create-new-leaderboard-position (player principal) (new-rating uint) (new-win-rate uint) (prize-amount uint))
+  (let (
+    (new-rank (+ (var-get global-leaderboard-size) u1))
+    (current-stats (get-player-stats player))
+  )
+    (var-set global-leaderboard-size new-rank)
+    
+    (map-set player-leaderboard-position
+      { player: player }
+      {
+        current-rank: new-rank,
+        previous-rank: u0,
+        rating: new-rating,
+        last-tournament-date: stacks-block-height
+      }
+    )
+    
+    (map-set global-leaderboard
+      { rank: new-rank }
+      {
+        player: player,
+        rating: new-rating,
+        tournaments-completed: (get tournaments-played current-stats),
+        total-prize-money: (get total-earnings current-stats),
+        win-rate: new-win-rate
+      }
+    )
+    true
+  )
+)
+
+(define-public (recompute-leaderboard-rankings)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (let ((leaderboard-size (var-get global-leaderboard-size)))
+      (try! (fold recompute-ranking-fold
+        (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20)
+        (ok leaderboard-size)
+      ))
+      (ok true)
+    )
+  )
+)
+
+(define-private (recompute-ranking-fold (index uint) (previous-result (response uint uint)))
+  (match previous-result
+    leaderboard-size (if (<= index leaderboard-size)
+      (let ((entry (map-get? global-leaderboard { rank: index })))
+        (match entry
+          leaderboard-entry (begin
+            (map-set player-leaderboard-position
+              { player: (get player leaderboard-entry) }
+              {
+                current-rank: index,
+                previous-rank: (match (map-get? player-leaderboard-position { player: (get player leaderboard-entry) })
+                  existing-pos (get current-rank existing-pos)
+                  u0),
+                rating: (get rating leaderboard-entry),
+                last-tournament-date: stacks-block-height
+              }
+            )
+            (ok leaderboard-size)
+          )
+          (ok leaderboard-size)
+        )
+      )
+      (ok leaderboard-size)
+    )
+    error-code (err error-code)
   )
 )
