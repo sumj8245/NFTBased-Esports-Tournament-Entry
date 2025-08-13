@@ -799,3 +799,368 @@
     error-code (err error-code)
   )
 )
+
+;; Tournament Match Analytics System
+(define-constant err-invalid-match-data (err u119))
+(define-constant err-match-not-found (err u120))
+(define-constant err-unauthorized-reporter (err u121))
+(define-constant err-invalid-performance-score (err u122))
+
+(define-data-var match-analytics-counter uint u0)
+
+;; Stores detailed match performance data
+(define-map match-analytics
+  { analytics-id: uint }
+  {
+    tournament-id: uint,
+    match-id: uint,
+    player: principal,
+    kills: uint,
+    deaths: uint,
+    assists: uint,
+    damage-dealt: uint,
+    healing-done: uint,
+    objective-score: uint,
+    match-duration: uint,
+    performance-rating: uint
+  }
+)
+
+;; Aggregated player performance statistics
+(define-map player-performance-stats
+  { player: principal }
+  {
+    total-matches: uint,
+    average-kills: uint,
+    average-deaths: uint,
+    average-assists: uint,
+    kill-death-ratio: uint,
+    total-damage: uint,
+    average-performance-rating: uint,
+    best-performance-rating: uint,
+    consistency-score: uint
+  }
+)
+
+;; Head-to-head statistics between players
+(define-map head-to-head-stats
+  { player1: principal, player2: principal }
+  {
+    matches-played: uint,
+    player1-wins: uint,
+    player2-wins: uint,
+    average-score-difference: uint
+  }
+)
+
+;; Tournament-specific analytics
+(define-map tournament-analytics
+  { tournament-id: uint }
+  {
+    total-matches-recorded: uint,
+    average-match-duration: uint,
+    highest-performance-rating: uint,
+    most-competitive-match: uint,
+    total-kills: uint,
+    total-damage: uint
+  }
+)
+
+;; Performance trend tracking
+(define-map player-performance-trends
+  { player: principal, period: uint }
+  {
+    matches-in-period: uint,
+    performance-improvement: int,
+    skill-trajectory: uint,
+    last-updated: uint
+  }
+)
+
+;; Read-only functions for analytics queries
+(define-read-only (get-match-analytics (analytics-id uint))
+  (map-get? match-analytics { analytics-id: analytics-id })
+)
+
+(define-read-only (get-player-performance-stats (player principal))
+  (default-to
+    {
+      total-matches: u0,
+      average-kills: u0,
+      average-deaths: u0,
+      average-assists: u0,
+      kill-death-ratio: u0,
+      total-damage: u0,
+      average-performance-rating: u0,
+      best-performance-rating: u0,
+      consistency-score: u0
+    }
+    (map-get? player-performance-stats { player: player })
+  )
+)
+
+(define-read-only (get-head-to-head-stats (player1 principal) (player2 principal))
+  (map-get? head-to-head-stats { player1: player1, player2: player2 })
+)
+
+(define-read-only (get-tournament-analytics (tournament-id uint))
+  (map-get? tournament-analytics { tournament-id: tournament-id })
+)
+
+(define-read-only (get-player-performance-trend (player principal) (period uint))
+  (map-get? player-performance-trends { player: player, period: period })
+)
+
+(define-read-only (get-analytics-counter)
+  (var-get match-analytics-counter)
+)
+
+;; Calculate performance rating based on match statistics
+(define-private (calculate-performance-rating (kills uint) (deaths uint) (assists uint) (damage uint) (objective uint))
+  (let (
+    (kd-component (if (is-eq deaths u0) (* kills u100) (/ (* kills u100) deaths)))
+    (damage-component (/ damage u1000))
+    (objective-component (* objective u50))
+    (assist-component (* assists u25))
+  )
+    (+ kd-component damage-component objective-component assist-component)
+  )
+)
+
+;; Record match performance data
+(define-public (record-match-performance 
+  (tournament-id uint) 
+  (match-id uint) 
+  (player principal) 
+  (kills uint) 
+  (deaths uint) 
+  (assists uint) 
+  (damage-dealt uint) 
+  (healing-done uint) 
+  (objective-score uint) 
+  (match-duration uint))
+  (let (
+    (analytics-id (+ (var-get match-analytics-counter) u1))
+    (performance-rating (calculate-performance-rating kills deaths assists damage-dealt objective-score))
+    (tournament (unwrap! (map-get? tournaments { tournament-id: tournament-id }) err-invalid-tournament-id))
+  )
+    ;; Only tournament owner or authorized reporters can record data
+    (asserts! (is-eq tx-sender contract-owner) err-unauthorized-reporter)
+    (asserts! (get tournament-ended tournament) err-tournament-not-ended)
+    (asserts! (<= performance-rating u10000) err-invalid-performance-score)
+    
+    ;; Store match analytics
+    (map-set match-analytics
+      { analytics-id: analytics-id }
+      {
+        tournament-id: tournament-id,
+        match-id: match-id,
+        player: player,
+        kills: kills,
+        deaths: deaths,
+        assists: assists,
+        damage-dealt: damage-dealt,
+        healing-done: healing-done,
+        objective-score: objective-score,
+        match-duration: match-duration,
+        performance-rating: performance-rating
+      }
+    )
+    
+    ;; Update analytics counter
+    (var-set match-analytics-counter analytics-id)
+    
+    ;; Update player performance statistics
+    (update-player-performance-stats player kills deaths assists damage-dealt performance-rating)
+    
+    ;; Update tournament analytics
+    (update-tournament-analytics tournament-id match-duration performance-rating kills damage-dealt)
+    
+    (ok analytics-id)
+  )
+)
+
+;; Update aggregated player performance statistics
+(define-private (update-player-performance-stats (player principal) (kills uint) (deaths uint) (assists uint) (damage uint) (performance-rating uint))
+  (let (
+    (current-stats (get-player-performance-stats player))
+    (total-matches (+ (get total-matches current-stats) u1))
+    (new-average-kills (/ (+ (* (get average-kills current-stats) (get total-matches current-stats)) kills) total-matches))
+    (new-average-deaths (/ (+ (* (get average-deaths current-stats) (get total-matches current-stats)) deaths) total-matches))
+    (new-average-assists (/ (+ (* (get average-assists current-stats) (get total-matches current-stats)) assists) total-matches))
+    (new-total-damage (+ (get total-damage current-stats) damage))
+    (new-average-performance (/ (+ (* (get average-performance-rating current-stats) (get total-matches current-stats)) performance-rating) total-matches))
+    (new-best-performance (if (> performance-rating (get best-performance-rating current-stats)) performance-rating (get best-performance-rating current-stats)))
+    (new-kd-ratio (if (is-eq new-average-deaths u0) (* new-average-kills u100) (/ (* new-average-kills u100) new-average-deaths)))
+    (consistency-variance (calculate-consistency-score performance-rating (get average-performance-rating current-stats)))
+  )
+    (map-set player-performance-stats
+      { player: player }
+      {
+        total-matches: total-matches,
+        average-kills: new-average-kills,
+        average-deaths: new-average-deaths,
+        average-assists: new-average-assists,
+        kill-death-ratio: new-kd-ratio,
+        total-damage: new-total-damage,
+        average-performance-rating: new-average-performance,
+        best-performance-rating: new-best-performance,
+        consistency-score: consistency-variance
+      }
+    )
+    true
+  )
+)
+
+;; Calculate consistency score based on performance variance
+(define-private (calculate-consistency-score (current-rating uint) (average-rating uint))
+  (let (
+    (difference (if (> current-rating average-rating) 
+                    (- current-rating average-rating) 
+                    (- average-rating current-rating)))
+    (variance-percentage (if (is-eq average-rating u0) u0 (/ (* difference u100) average-rating)))
+  )
+    (if (<= variance-percentage u10) u100
+      (if (<= variance-percentage u20) u80
+        (if (<= variance-percentage u30) u60
+          (if (<= variance-percentage u50) u40 u20))))
+  )
+)
+
+;; Update tournament-wide analytics
+(define-private (update-tournament-analytics (tournament-id uint) (match-duration uint) (performance-rating uint) (kills uint) (damage uint))
+  (let (
+    (current-analytics (default-to
+      {
+        total-matches-recorded: u0,
+        average-match-duration: u0,
+        highest-performance-rating: u0,
+        most-competitive-match: u0,
+        total-kills: u0,
+        total-damage: u0
+      }
+      (map-get? tournament-analytics { tournament-id: tournament-id })))
+    (total-matches (+ (get total-matches-recorded current-analytics) u1))
+    (new-average-duration (/ (+ (* (get average-match-duration current-analytics) (get total-matches-recorded current-analytics)) match-duration) total-matches))
+    (new-highest-rating (if (> performance-rating (get highest-performance-rating current-analytics)) performance-rating (get highest-performance-rating current-analytics)))
+  )
+    (map-set tournament-analytics
+      { tournament-id: tournament-id }
+      {
+        total-matches-recorded: total-matches,
+        average-match-duration: new-average-duration,
+        highest-performance-rating: new-highest-rating,
+        most-competitive-match: (get most-competitive-match current-analytics),
+        total-kills: (+ (get total-kills current-analytics) kills),
+        total-damage: (+ (get total-damage current-analytics) damage)
+      }
+    )
+    true
+  )
+)
+
+;; Record head-to-head match result
+(define-public (record-head-to-head-result (player1 principal) (player2 principal) (winner principal) (score-difference uint))
+  (let (
+    (current-h2h (default-to
+      {
+        matches-played: u0,
+        player1-wins: u0,
+        player2-wins: u0,
+        average-score-difference: u0
+      }
+      (map-get? head-to-head-stats { player1: player1, player2: player2 })))
+    (matches-played (+ (get matches-played current-h2h) u1))
+    (player1-wins (if (is-eq winner player1) (+ (get player1-wins current-h2h) u1) (get player1-wins current-h2h)))
+    (player2-wins (if (is-eq winner player2) (+ (get player2-wins current-h2h) u1) (get player2-wins current-h2h)))
+    (new-avg-score-diff (/ (+ (* (get average-score-difference current-h2h) (get matches-played current-h2h)) score-difference) matches-played))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-unauthorized-reporter)
+    (asserts! (or (is-eq winner player1) (is-eq winner player2)) err-invalid-match-data)
+    
+    (map-set head-to-head-stats
+      { player1: player1, player2: player2 }
+      {
+        matches-played: matches-played,
+        player1-wins: player1-wins,
+        player2-wins: player2-wins,
+        average-score-difference: new-avg-score-diff
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Update player performance trends
+(define-public (update-performance-trend (player principal) (period uint))
+  (let (
+    (current-stats (get-player-performance-stats player))
+    (previous-trend (map-get? player-performance-trends { player: player, period: (- period u1) }))
+    (current-avg-performance (get average-performance-rating current-stats))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-unauthorized-reporter)
+    
+    (let (
+      (performance-change (match previous-trend
+        prev-data (- (to-int current-avg-performance) (to-int (get skill-trajectory prev-data)))
+        (to-int current-avg-performance)))
+      (skill-trajectory current-avg-performance)
+    )
+      (map-set player-performance-trends
+        { player: player, period: period }
+        {
+          matches-in-period: (get total-matches current-stats),
+          performance-improvement: performance-change,
+          skill-trajectory: skill-trajectory,
+          last-updated: stacks-block-height
+        }
+      )
+      (ok true)
+    )
+  )
+)
+
+;; Get top performers in a specific category
+(define-read-only (get-top-performers-by-metric (metric (string-ascii 20)) (limit uint))
+  (if (is-eq metric "kills")
+    (get-top-killers limit)
+    (if (is-eq metric "damage")
+      (get-top-damage-dealers limit)
+      (if (is-eq metric "rating")
+        (get-top-rated-players limit)
+        (list none none none none none)))))
+
+(define-private (get-top-killers (limit uint))
+  (list 
+    (get-performance-rank-entry u1 "kills")
+    (get-performance-rank-entry u2 "kills")
+    (get-performance-rank-entry u3 "kills")
+    (get-performance-rank-entry u4 "kills")
+    (get-performance-rank-entry u5 "kills")
+  )
+)
+
+(define-private (get-top-damage-dealers (limit uint))
+  (list 
+    (get-performance-rank-entry u1 "damage")
+    (get-performance-rank-entry u2 "damage")
+    (get-performance-rank-entry u3 "damage")
+    (get-performance-rank-entry u4 "damage")
+    (get-performance-rank-entry u5 "damage")
+  )
+)
+
+(define-private (get-top-rated-players (limit uint))
+  (list 
+    (get-performance-rank-entry u1 "rating")
+    (get-performance-rank-entry u2 "rating")
+    (get-performance-rank-entry u3 "rating")
+    (get-performance-rank-entry u4 "rating")
+    (get-performance-rank-entry u5 "rating")
+  )
+)
+
+(define-private (get-performance-rank-entry (rank uint) (metric (string-ascii 20)))
+  none
+)
+
